@@ -26,14 +26,19 @@
   hashivault_read:
     secret: 'database/postgres/pgpassword'
     key: 'value'
+  when: postgres_status.rc == 1
+
+- name: Set fact to carry database secret
   set_fact:
     pgpassword: "{{lookup('hashivault', 'database/postgres/pgpassword', 'value')}}"
+  when: postgres_status.rc == 1
 
 - name: Set docker secret
   docker_secret:
     name: postgres_password
     data: "{{pgpassword}}"
     state: present
+  when: pgpassword is defined
 
 - name: Deploy postgresql service
   command: |
@@ -48,8 +53,6 @@
     --replicas 1 \
     postgres:latest
   when: postgres_status.rc == 1
-
-  #  --mount type=bind,src=/srv/docker-volumes/postgres/pgdata,dst=/var/lib/postgresql/data \
 
 - name: Wait for port 5432 of any IP to close active connections
   wait_for:
