@@ -22,18 +22,34 @@
     mode: 0777
   when: postgres_status.rc == 1
 
+- name: Retrieve password from vault
+  hashivault_read:
+    secret: 'database/postgres/pgpassword'
+    key: 'value'
+  set_fact:
+    pgpassword: "{{lookup('hashivault', 'database/postgres/pgpassword', 'value')}}"
+
+- name: Set docker secret
+  docker_secret:
+    name: postgres_password
+    data: "{{pgpassword}}"
+    state: present
+
 - name: Deploy postgresql service
   command: |
     docker service create -d \
     --name postgres \
     --network mangonet \
     --publish 5432:5432 \
-    --mount type=bind,src=/srv/docker-volumes/postgres/pgdata,dst=/var/lib/postgresql/data \
+    --mount 'type=volume,"volume-opt=o=addr=grid011.sysmango.net,vers=4.1",volume-opt=device=:/srv/nfs/postgres/pgdata,volume-opt=type=nfs,target=/var/lib/postgresql/data' \
+    --secret source=postgres_password,target=postgres_password
     --env PGDATA=/var/lib/postgresql/data \
-    --env POSTGRES_PASSWORD=######## \
+    --env POSTGRES_PASSWORD_FILE=/run/secret/postgres_password \
     --replicas 1 \
     postgres:latest
   when: postgres_status.rc == 1
+
+  #  --mount type=bind,src=/srv/docker-volumes/postgres/pgdata,dst=/var/lib/postgresql/data \
 
 - name: Wait for port 5432 of any IP to close active connections
   wait_for:
