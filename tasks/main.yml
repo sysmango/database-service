@@ -1,2 +1,44 @@
 ---
-# tasks file for database-service
+
+- name: Check if postgres service is running
+  shell: docker service ls | awk '{print $2}' | grep -v postgres9 | grep postgres
+  changed_when: false
+  register: postgres_status
+  failed_when: postgres_status.rc == 2
+
+- name: Create volume directory for postgres
+  become: "yes"
+  file:
+    path: /srv/nfs/postgres
+    state: directory
+    mode: 0777
+  when: postgres_status.rc == 1
+
+- name: Create volume directory for postgres
+  become: "yes"
+  file:
+    path: /srv/nfs/postgres/pgdata
+    state: directory
+    mode: 0777
+  when: postgres_status.rc == 1
+
+- name: Deploy postgresql service
+  command: |
+    docker service create -d \
+    --name postgres \
+    --network mangonet \
+    --publish 5432:5432 \
+    --mount type=bind,src=/srv/docker-volumes/postgres/pgdata,dst=/var/lib/postgresql/data \
+    --env PGDATA=/var/lib/postgresql/data \
+    --env POSTGRES_PASSWORD=######## \
+    --replicas 1 \
+    postgres:latest
+  when: postgres_status.rc == 1
+
+- name: Wait for port 5432 of any IP to close active connections
+  wait_for:
+    host: postgres.sysmango.net
+    port: 5432
+    state: started
+    timeout: 5000
+
