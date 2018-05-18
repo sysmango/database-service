@@ -60,4 +60,3 @@
     port: 5432
     state: started
     timeout: 5000
-
