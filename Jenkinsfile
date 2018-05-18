@@ -11,14 +11,6 @@ pipeline {
                       parallel(
                               a: {
                                     try{
-                                          sh "yamllint -c jenkins/yamllint_config *.yml"
-                                    } catch (err) {
-                                          echo "yamllint reported errors, continuing with pipeline"
-                                          currentBuild.result = 'UNSTABLE' 
-					      }                                          
-                              },
-                              b: {
-                                    try{
                                           sh "yamllint -c jenkins/yamllint_config */*.yml"
                                     } catch (err) {
                                           echo "yamllint reported errors, continuing with pipeline"
@@ -35,14 +27,6 @@ pipeline {
                   script {
                       parallel(
                               a: {
-                                    try{
-                                          sh "ansible-lint -c jenkins/ansible-lint_config *.yml"
-                                    } catch (err) {
-                                          echo "ansible-lint reported errors, continuing with pipeline"
-                                          currentBuild.result = 'UNSTABLE' 
-					      }                                          
-                              },
-                              b: {
                                     try{
                                           sh "ansible-lint -c jenkins/ansible-lint_config */*.yml"
                                     } catch (err) {
