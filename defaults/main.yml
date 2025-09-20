@@ -1,0 +1,55 @@
+---
+# Environment and namespace
+env: prod
+db_namespace: "sysmango-data-{{ env }}"
+
+# Vault integration for postgres password
+pg_password_from_vault: true
+pg_vault_secret: "sysmango/postgresql-prod"
+pg_vault_field: "postgres_password"
+# Vault connection (can also come from environment)
+vault_addr: "https://vault.sysmango.net:8200"
+vault_namespace: ""
+
+# Postgres settings
+pg_user: "postgres"
+# Use internal registry mirror for Docker Hub
+# If your Nexus proxy handles library/ namespace implicitly, this still works.
+pg_image: "registry.sysmango.net/library/postgres:17-alpine"
+resources:
+  requests:
+    cpu: "250m"
+    memory: "512Mi"
+  limits:
+    cpu: "1"
+    memory: "2Gi"
+
+# TLS via cert-manager
+pg_hostname: "postgres.sysmango.net"
+pg_certificate_issuer_name: "vault-issuer"
+pg_tls_secret_name: "postgres-db-tls"
+
+# NFS storage
+nfs_server: files
+nfs_server_host: "{{ nfs_server }}"
+nfs_postgres_data_path: "/srv/nfs/{{ env }}/postgres"
+nfs_dir_mode: "0700"
+nfs_dir_owner: "999"
+nfs_dir_group: "999"
+pvc_size: "20Gi"
+
+# Traefik TCP entryPoint configuration
+enable_traefik_postgres_entrypoint: true
+traefik_entrypoint_name: "postgres"
+traefik_entrypoint_port: 5432
+traefik_namespace: "kube-system"
+traefik_deployment_name: "traefik"
+traefik_service_name: "traefik"
+
+# Traefik Helm management (Option A)
+# Existing release is assumed to be named 'traefik' in kube-system.
+# The chart is from the official Traefik Helm repo.
+traefik_helm_release_name: "traefik"
+traefik_chart_ref: "traefik"
+traefik_chart_repo_url: "https://helm.traefik.io/traefik"
+

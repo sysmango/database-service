@@ -1,62 +1,535 @@
 ---
+# Database Service role: centralized PostgreSQL with NFS-backed storage, TLS via cert-manager,
+# and Traefik TCP passthrough on a dedicated entryPoint.
 
-- name: Check if postgres service is running
-  shell: docker service ls | awk '{print $2}' | grep -v postgres9 | grep postgres
-  changed_when: false
-  register: postgres_status
-  failed_when: postgres_status.rc == 2
+# Preflight: required CRDs
+- name: Preflight | Check cert-manager CRDs present
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: certificates.cert-manager.io
+  register: cm_cert_crd
 
-- name: Create volume directory for postgres
-  become: "yes"
-  file:
-    path: /srv/nfs/postgres
-    state: directory
-    mode: 0777
-  when: postgres_status.rc == 1
+- name: Preflight | Check Traefik IngressRouteTCP CRD present
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: ingressroutetcps.traefik.io
+  register: traefik_irtcp_crd
 
-- name: Create volume directory for postgres
-  become: "yes"
-  file:
-    path: /srv/nfs/postgres/pgdata
-    state: directory
-    mode: 0777
-  when: postgres_status.rc == 1
+- name: Preflight | Assert required CRDs exist
+  ansible.builtin.assert:
+    that:
+      - (cm_cert_crd.resources | length) > 0
+      - (traefik_irtcp_crd.resources | length) > 0
+    fail_msg: "Required CRDs missing. Ensure cert-manager and Traefik v3 are installed (certificates.cert-manager.io, ingressroutetcps.traefik.io)."
+    success_msg: "All required CRDs are present."
 
-- name: Retrieve password from vault
+# Vault: fetch postgres password
+- name: Vault | Read Postgres secret (KV v2)
   hashivault_read:
-    secret: 'database/postgres/pgpassword'
-    key: 'value'
-  when: postgres_status.rc == 1
+    url: "{{ vault_addr }}"
+    namespace: "{{ vault_namespace | default('') }}"
+    mount_point: "kv"
+    secret: "{{ pg_vault_secret }}"
+    version: 2
+    verify: false
+  register: vault_pg
+  environment:
+    VAULT_ADDR: "{{ vault_addr }}"
+    VAULT_NAMESPACE: "{{ vault_namespace | default('') }}"
+  when: pg_password_from_vault | default(true)
 
-- name: Set fact to carry database secret
-  set_fact:
-    pgpassword: "{{lookup('hashivault', 'database/postgres/pgpassword', 'value')}}"
-  when: postgres_status.rc == 1
+- name: Vault | Set facts from secret
+  ansible.builtin.set_fact:
+    pg_secret_map: "{{ vault_pg.value | default(vault_pg.data) }}"
+    pg_user: "{{ pg_user | default('postgres') }}"
+    postgres_password: "{{ (vault_pg.value[pg_vault_field] | default(vault_pg.data[pg_vault_field])) | default(postgres_password | default('')) }}"
+  when: pg_password_from_vault | default(true)
 
-- name: Set docker secret
-  docker_secret:
-    name: postgres_password
-    data: "{{pgpassword}}"
+- name: Vault | Validate DB values present (if enabled)
+  ansible.builtin.assert:
+    that:
+      - (pg_user | default('')) | length > 0
+      - (postgres_password | default('')) | length > 0
+    fail_msg: "Vault DB values missing. Ensure secret {{ pg_vault_secret }} has key: {{ pg_vault_field }}."
+    success_msg: "Vault DB values loaded."
+  when: pg_password_from_vault | default(true)
+
+# NFS preflight
+- name: Preflight | Assert nfs_server_host is provided
+  ansible.builtin.assert:
+    that:
+      - (nfs_server_host | default('')) | length > 0
+    fail_msg: "nfs_server_host is not set. Provide the inventory host or IP of the NFS server."
+    success_msg: "nfs_server_host provided."
+
+- name: NFS | Verify connectivity to NFS server
+  ansible.builtin.ping:
+  delegate_to: "{{ nfs_server_host }}"
+
+- name: NFS | Create Postgres export root directory on NFS server
+  ansible.builtin.file:
+    path: "{{ nfs_postgres_data_path }}"
+    state: directory
+    mode: "{{ nfs_dir_mode }}"
+    owner: "{{ nfs_dir_owner }}"
+    group: "{{ nfs_dir_group }}"
+    recurse: true
+  delegate_to: "{{ nfs_server_host }}"
+  become: true
+
+- name: NFS | Ensure Postgres data ownership (recursive) on NFS server
+  ansible.builtin.file:
+    path: "{{ nfs_postgres_data_path }}"
+    owner: "999"
+    group: "999"
+    recurse: true
+  delegate_to: "{{ nfs_server_host }}"
+  become: true
+
+- name: NFS | Ensure Postgres data directory permissions on NFS server
+  ansible.builtin.file:
+    path: "{{ nfs_postgres_data_path }}"
+    state: directory
+    mode: "0700"
+  delegate_to: "{{ nfs_server_host }}"
+  become: true
+
+# Namespace
+- name: Create database namespace
+  kubernetes.core.k8s:
+    name: "{{ db_namespace }}"
+    api_version: v1
+    kind: Namespace
     state: present
-  when: pgpassword is defined
 
-- name: Deploy postgresql service
-  command: |
-    docker service create -d \
-    --name postgres \
-    --network mangonet \
-    --publish 5432:5432 \
-    --mount 'type=volume,"volume-opt=o=addr=grid011.sysmango.net,vers=4.1",volume-opt=device=:/srv/nfs/postgres/pgdata,volume-opt=type=nfs,target=/var/lib/postgresql/data' \
-    --secret source=postgres_password,target=postgres_password
-    --env PGDATA=/var/lib/postgresql/data \
-    --env POSTGRES_PASSWORD_FILE=/run/secret/postgres_password \
-    --replicas 1 \
-    postgres:latest
-  when: postgres_status.rc == 1
+# TLS Certificate via cert-manager
+- name: Create Certificate for Postgres (cert-manager)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: postgres-cert
+        namespace: "{{ db_namespace }}"
+      spec:
+        secretName: "{{ pg_tls_secret_name }}"
+        commonName: "{{ pg_hostname }}"
+        dnsNames:
+          - "{{ pg_hostname }}"
+        issuerRef:
+          name: "{{ pg_certificate_issuer_name }}"
+          kind: ClusterIssuer
 
-- name: Wait for port 5432 of any IP to close active connections
-  wait_for:
-    host: postgres.sysmango.net
-    port: 5432
-    state: started
-    timeout: 5000
+# Storage: PV + PVC bound to NFS
+- name: Create NFS PersistentVolume for Postgres
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata:
+        name: "postgres-pv-{{ env }}"
+      spec:
+        storageClassName: ""
+        capacity:
+          storage: "{{ pvc_size }}"
+        accessModes: ["ReadWriteMany"]
+        persistentVolumeReclaimPolicy: Retain
+        nfs:
+          server: "{{ nfs_server_host }}"
+          path: "{{ nfs_postgres_data_path }}"
+        mountOptions: ["nfsvers=4.1"]
+
+- name: Create PersistentVolumeClaim for Postgres
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: postgres-pvc
+        namespace: "{{ db_namespace }}"
+      spec:
+        storageClassName: ""
+        accessModes: ["ReadWriteMany"]
+        resources:
+          requests:
+            storage: "{{ pvc_size }}"
+        volumeName: "postgres-pv-{{ env }}"
+
+# Secret for Postgres credentials
+- name: Create Postgres config secret (env vars)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: postgres-config
+        namespace: "{{ db_namespace }}"
+      type: Opaque
+      stringData:
+        POSTGRES_USER: "{{ pg_user }}"
+        POSTGRES_PASSWORD: "{{ postgres_password }}"
+
+# StatefulSet with TLS passthrough
+- name: Deploy PostgreSQL StatefulSet with TLS
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: postgresql
+        namespace: "{{ db_namespace }}"
+      spec:
+        serviceName: postgresql
+        replicas: 1
+        selector:
+          matchLabels:
+            app: postgresql
+        template:
+          metadata:
+            labels:
+              app: postgresql
+          spec:
+            securityContext:
+              runAsUser: 999
+              runAsGroup: 999
+              fsGroup: 999
+              fsGroupChangePolicy: OnRootMismatch
+            initContainers:
+              - name: init-tls-perms
+                image: alpine:3.20
+                command: ["/bin/sh","-c"]
+                args:
+                  - |
+                    set -e
+                    cp /certs/tls.crt /tls/server.crt
+                    cp /certs/tls.key /tls/server.key
+                    chown 999:999 /tls/server.*
+                    chmod 600 /tls/server.key
+                volumeMounts:
+                  - name: tls-src
+                    mountPath: /certs
+                  - name: tls-dst
+                    mountPath: /tls
+            containers:
+              - name: postgres
+                image: "{{ pg_image }}"
+                imagePullPolicy: IfNotPresent
+                args:
+                  - "-c"
+                  - "listen_addresses=*"
+                  - "-c"
+                  - "ssl=on"
+                  - "-c"
+                  - "ssl_cert_file=/tls/server.crt"
+                  - "-c"
+                  - "ssl_key_file=/tls/server.key"
+                env:
+                  - name: POSTGRES_USER
+                    valueFrom:
+                      secretKeyRef:
+                        name: postgres-config
+                        key: POSTGRES_USER
+                  - name: POSTGRES_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: postgres-config
+                        key: POSTGRES_PASSWORD
+                ports:
+                  - containerPort: 5432
+                    name: postgres
+                readinessProbe:
+                  exec:
+                    command: ["/bin/sh","-c","pg_isready -U ${POSTGRES_USER} -h 127.0.0.1 -p 5432"]
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+                livenessProbe:
+                  exec:
+                    command: ["/bin/sh","-c","pg_isready -U ${POSTGRES_USER} -h 127.0.0.1 -p 5432"]
+                  initialDelaySeconds: 30
+                  periodSeconds: 20
+                resources:
+                  requests:
+                    cpu: "{{ resources.requests.cpu }}"
+                    memory: "{{ resources.requests.memory }}"
+                  limits:
+                    cpu: "{{ resources.limits.cpu }}"
+                    memory: "{{ resources.limits.memory }}"
+                volumeMounts:
+                  - name: data
+                    mountPath: /var/lib/postgresql/data
+                  - name: tls-dst
+                    mountPath: /tls
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: postgres-pvc
+              - name: tls-src
+                secret:
+                  secretName: "{{ pg_tls_secret_name }}"
+              - name: tls-dst
+                emptyDir: {}
+
+# Service
+- name: Create Postgres service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: postgresql
+        namespace: "{{ db_namespace }}"
+      spec:
+        ports:
+          - name: postgres
+            port: 5432
+            targetPort: 5432
+        selector:
+          app: postgresql
+
+# Traefik configuration for K3s-installed Traefik
+- name: Traefik | Get current Deployment
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: "{{ traefik_deployment_name }}"
+    namespace: "{{ traefik_namespace }}"
+  register: traefik_dep
+  when: enable_traefik_postgres_entrypoint | default(true)
+
+- name: Traefik | Compute if entryPoint arg already present
+  vars:
+    desired_arg_deploy: "--entryPoints.{{ traefik_entrypoint_name }}.address=:{{ traefik_entrypoint_port }}/tcp"
+  ansible.builtin.set_fact:
+    traefik_dep_has_arg: >-
+      {{
+        (traefik_dep.resources | default([])) | length > 0 and
+        desired_arg_deploy in (traefik_dep.resources[0].spec.template.spec.containers[0].args | default([]))
+      }}
+  when: enable_traefik_postgres_entrypoint | default(true)
+
+- name: Traefik | Add postgres entryPoint to K3s Traefik deployment
+  kubernetes.core.k8s_json_patch:
+    api_version: apps/v1
+    kind: Deployment
+    name: "{{ traefik_deployment_name }}"
+    namespace: "{{ traefik_namespace }}"
+    patch:
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: "--entryPoints.{{ traefik_entrypoint_name }}.address=:{{ traefik_entrypoint_port }}/tcp"
+  when:
+    - enable_traefik_postgres_entrypoint | default(true)
+    - not (traefik_dep_has_arg | default(false))
+
+- name: Traefik | Get current Service
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Service
+    name: "{{ traefik_service_name }}"
+    namespace: "{{ traefik_namespace }}"
+  register: traefik_svc
+  when: enable_traefik_postgres_entrypoint | default(true)
+
+- name: Traefik | Compute if postgres port already present in Service
+  ansible.builtin.set_fact:
+    traefik_svc_has_port: >-
+      {{
+        (traefik_svc.resources | default([])) | length > 0 and (
+          (traefik_entrypoint_name in (traefik_svc.resources[0].spec.ports | map(attribute='name') | list | default([])))
+          or (5432 in (traefik_svc.resources[0].spec.ports | map(attribute='port') | list | default([])))
+        )
+      }}
+  when: enable_traefik_postgres_entrypoint | default(true)
+
+- name: Traefik | Add postgres port to K3s Traefik service
+  kubernetes.core.k8s_json_patch:
+    api_version: v1
+    kind: Service
+    name: "{{ traefik_service_name }}"
+    namespace: "{{ traefik_namespace }}"
+    patch:
+      - op: add
+        path: /spec/ports/-
+        value:
+          name: "{{ traefik_entrypoint_name }}"
+          port: 5432
+          protocol: TCP
+          targetPort: 5432
+  when:
+    - enable_traefik_postgres_entrypoint | default(true)
+    - not (traefik_svc_has_port | default(false))
+
+# Traefik TCP ingress (passthrough)
+- name: Create Traefik IngressRouteTCP for Postgres (passthrough)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRouteTCP
+      metadata:
+        name: postgresql-ingress-tcp
+        namespace: "{{ db_namespace }}"
+      spec:
+        entryPoints:
+          - "{{ traefik_entrypoint_name }}"
+        tls:
+          passthrough: true
+        routes:
+          - match: "HostSNI(`{{ pg_hostname }}`)"
+            services:
+              - name: postgresql
+                port: 5432
+
+# Cleanup block
+- name: Cleanup | Remove database resources
+  tags:
+    - never
+    - cleanup
+  when:
+    - cleanup | default(false)
+    - "'database-service' in ansible_run_tags"
+  block:
+    - name: Cleanup | Proceed marker
+      ansible.builtin.debug:
+        msg: "Running cleanup for database-service"
+    - name: Cleanup | Get Traefik Service
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        name: "{{ traefik_service_name }}"
+        namespace: "{{ traefik_namespace }}"
+      register: cleanup_traefik_svc
+
+    - name: Cleanup | Compute Traefik Service port index for entryPoint
+      ansible.builtin.set_fact:
+        traefik_svc_port_index: "{{ (cleanup_traefik_svc.resources[0].spec.ports | map(attribute='name') | list).index(traefik_entrypoint_name) }}"
+      when:
+        - (cleanup_traefik_svc.resources | default([])) | length > 0
+        - traefik_entrypoint_name in (cleanup_traefik_svc.resources[0].spec.ports | map(attribute='name') | list)
+
+    - name: Cleanup | Remove Traefik Service port for entryPoint (if present)
+      kubernetes.core.k8s_json_patch:
+        api_version: v1
+        kind: Service
+        name: "{{ traefik_service_name }}"
+        namespace: "{{ traefik_namespace }}"
+        patch:
+          - op: remove
+            path: "/spec/ports/{{ traefik_svc_port_index }}"
+      when: traefik_svc_port_index is defined
+      ignore_errors: true
+
+    - name: Cleanup | Get Traefik Deployment
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ traefik_deployment_name }}"
+        namespace: "{{ traefik_namespace }}"
+      register: cleanup_traefik_dep
+
+    - name: Cleanup | Compute arg index for entryPoint in Traefik Deployment
+      vars:
+        desired_arg: "--entryPoints.{{ traefik_entrypoint_name }}.address=:{{ traefik_entrypoint_port }}"
+      ansible.builtin.set_fact:
+        traefik_dep_arg_index: "{{ (cleanup_traefik_dep.resources[0].spec.template.spec.containers[0].args | list).index(desired_arg) }}"
+      when:
+        - (cleanup_traefik_dep.resources | default([])) | length > 0
+        - desired_arg in (cleanup_traefik_dep.resources[0].spec.template.spec.containers[0].args | list)
+
+    - name: Cleanup | Remove entryPoint arg from Traefik Deployment (if present)
+      kubernetes.core.k8s_json_patch:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ traefik_deployment_name }}"
+        namespace: "{{ traefik_namespace }}"
+        patch:
+          - op: remove
+            path: "/spec/template/spec/containers/0/args/{{ traefik_dep_arg_index }}"
+      when: traefik_dep_arg_index is defined
+      ignore_errors: true
+
+    - name: Cleanup | Remove IngressRouteTCP
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: traefik.io/v1alpha1
+          kind: IngressRouteTCP
+          metadata:
+            name: postgresql-ingress-tcp
+            namespace: "{{ db_namespace }}"
+
+    - name: Cleanup | Remove Service
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgresql
+            namespace: "{{ db_namespace }}"
+
+    - name: Cleanup | Remove StatefulSet
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: postgresql
+            namespace: "{{ db_namespace }}"
+
+    - name: Cleanup | Remove PVC
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: postgres-pvc
+            namespace: "{{ db_namespace }}"
+
+    - name: Cleanup | Remove PV
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: "postgres-pv-{{ env }}"
+
+    - name: Cleanup | Remove TLS Certificate
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: postgres-cert
+            namespace: "{{ db_namespace }}"
+
+    - name: Cleanup | Remove TLS secret
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ pg_tls_secret_name }}"
+            namespace: "{{ db_namespace }}"
+
+    - name: Cleanup | Remove Namespace (last)
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ db_namespace }}"

@@ -1,0 +1,16 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: {{ traefik_helm_release_name | default('traefik') }}
+  namespace: {{ traefik_namespace }}
+spec:
+  valuesContent: |-
+    ports:
+      {{ traefik_entrypoint_name }}:
+        port: {{ traefik_entrypoint_port }}
+        targetPort: {{ traefik_entrypoint_port }}
+        expose: true
+        exposedPort: {{ traefik_entrypoint_port }}
+        protocol: TCP
+    additionalArguments:
+      - "--entrypoints.{{ traefik_entrypoint_name }}.address=:{{ traefik_entrypoint_port }}/tcp"

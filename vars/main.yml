@@ -1,0 +1,5 @@
+---
+# Intentionally minimal. Prefer overriding defaults via inventory/group_vars/host_vars.
+# Examples (do not commit secrets):
+# pg_password_from_vault: true
+# env: prod
